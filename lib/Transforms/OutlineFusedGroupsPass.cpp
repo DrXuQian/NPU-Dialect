@@ -228,10 +228,11 @@ struct NPUOutlineFusedGroupsPass
       }
     }
 
-    // Build the function name.
+    // Build the function name (unique per group index).
     std::string funcName = "fused";
     for (Operation *op : ops)
       funcName += "_" + getOpShortName(op);
+    funcName += "_" + std::to_string(groupIndex);
 
     // Build function type.
     SmallVector<Type> inputTypes;
