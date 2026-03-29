@@ -21,6 +21,10 @@
 
 namespace npu {
 
+// Forward declarations from OperatorTilingSpec.h
+struct SplitDimSpec;
+struct OperatorTilingSpec;
+
 //===----------------------------------------------------------------------===//
 // Hardware target descriptor
 //===----------------------------------------------------------------------===//
@@ -127,6 +131,25 @@ public:
   /// Returns the worst-case single-core cost (determines wall time).
   ScheduleCost evaluateSpatialSplit(mlir::Operation *op, unsigned splitDim,
                                     int64_t numChunks) const;
+
+  /// Evaluate spatial split using OperatorTilingSpec — precisely accounts for:
+  ///   - Per-core DMA for Split operands (sliced data)
+  ///   - Per-core DMA for Shared operands (full data, replicated to each core)
+  ///   - Per-core DMA for Halo operands (sliced + overlap)
+  ///   - Output: no concat needed (insert_slice handles it)
+  ///   - Reduction: needs cross-core accumulation (penalty)
+  struct SpatialSplitCost {
+    int64_t perCoreDmaInBytes = 0;  // total bytes each core loads
+    int64_t perCoreComputeCycles = 0;
+    int64_t sharedDataBytes = 0;    // bytes replicated to every core
+    int64_t splitDataBytes = 0;     // bytes unique to each core
+    int64_t haloOverheadBytes = 0;  // extra bytes due to halo overlap
+    bool needsReduce = false;       // true if splitting a reduction dim
+    int64_t totalCycles = 0;        // overall estimate
+  };
+  SpatialSplitCost evaluateSpatialSplitDetailed(
+      mlir::Operation *op, const struct SplitDimSpec &dimSpec,
+      int64_t numChunks) const;
 
   /// Compare retile vs spill strategy.
   enum class SpillStrategy { Retile, Spill };

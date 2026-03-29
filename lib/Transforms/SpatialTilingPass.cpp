@@ -1,23 +1,19 @@
 //===- SpatialTilingPass.cpp - Inter-core distribution --------*- C++ -*-===//
 //
-// Tiles linalg ops and distributes across cores using scf.for.
-// Uses CostModel.evaluateSpatialSplit() to pick the best split dimension.
+// Tiles linalg ops and distributes across cores.
+// Uses OperatorTilingSpec to understand per-op split semantics:
+//   - Which dimensions are parallel vs reduction
+//   - Which inputs are split vs shared vs need halo
+//   - Data reuse patterns for DMA cost estimation
 //
-// Key correctness requirement:
-//   For conv2d, tiling the output H dimension requires extracting an
-//   input slice with halo (extra rows for the kernel). The TilingInterface
-//   handles this automatically when tile sizes are specified in the
-//   iteration domain coordinate system (not the output tensor rank).
-//
-//   conv2d_nchw_fchw has 7 iteration dims: (N, F, OH, OW, C, KH, KW)
-//   - Parallel:  N(0), F(1), OH(2), OW(3)
-//   - Reduction: C(4), KH(5), KW(6)
-//   Tile sizes must be length 7, with 0 for untiled dims.
+// Uses CostModel to evaluate the cost of each candidate split dimension,
+// considering the spec's reuse ratio and shared-data DMA savings.
 //
 //===----------------------------------------------------------------------===//
 
 #include "npu/Transforms/Passes.h"
 #include "npu/Analysis/CostModel.h"
+#include "npu/Analysis/OperatorTilingSpec.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -33,18 +29,6 @@ using namespace mlir;
 using namespace npu;
 
 namespace {
-
-/// Map an output-tensor dimension index to the corresponding iteration
-/// domain dimension for a linalg op.  For matmul (M,N,K) the output
-/// is (M,N) → iter dims 0,1.  For conv2d_nchw_fchw the output is
-/// (N,F,OH,OW) → iter dims 0,1,2,3.  For generic ops the mapping is
-/// usually identity.
-static unsigned outputDimToIterDim(linalg::LinalgOp op, unsigned outDim) {
-  // For most ops, output dims map 1:1 to the first output-rank iteration dims.
-  // This is correct for matmul, conv2d named ops, and most generics.
-  (void)op;
-  return outDim;
-}
 
 struct NPUSpatialTilingPass
     : public npu::impl::NPUSpatialTilingBase<NPUSpatialTilingPass> {
@@ -80,30 +64,79 @@ struct NPUSpatialTilingPass
       SmallVector<utils::IteratorType> iterTypes = op.getIteratorTypesArray();
       unsigned numLoops = iterTypes.size();
 
-      // --- Search: evaluate each parallel output dimension ---
-      unsigned bestOutDim = 0;
+      // Get per-operator tiling spec
+      const OperatorTilingSpec *spec = getTilingSpec(op);
+
+      // --- Pick the best split dimension ---
+      unsigned bestIterDim = 0;
       int64_t bestCost = std::numeric_limits<int64_t>::max();
 
-      for (unsigned outDim = 0;
-           outDim < static_cast<unsigned>(outType.getRank()); ++outDim) {
-        unsigned iterDim = outputDimToIterDim(op, outDim);
-        if (iterDim >= numLoops)
-          continue;
-        if (iterTypes[iterDim] == utils::IteratorType::reduction)
-          continue;
+      if (spec) {
+        // Use OperatorTilingSpec + detailed cost model
+        for (const auto &dimSpec : spec->splitDims) {
+          if (!dimSpec.isParallel)
+            continue; // skip reduction dims for spatial tiling
+          if (dimSpec.iterDim >= numLoops)
+            continue;
 
-        ScheduleCost cost = costModel.evaluateSpatialSplit(op, outDim, cores);
-        if (cost.totalCycles < bestCost) {
-          bestCost = cost.totalCycles;
-          bestOutDim = outDim;
+          int64_t dimSize = 0;
+          if (dimSpec.outputDim < static_cast<unsigned>(outType.getRank()))
+            dimSize = outType.getDimSize(dimSpec.outputDim);
+          if (dimSize <= 1)
+            continue;
+
+          // Precise cost considering per-operand slice/shared/halo semantics
+          auto splitCost = costModel.evaluateSpatialSplitDetailed(
+              op, dimSpec, cores);
+
+          op->emitRemark("spatial split candidate: iter_dim=")
+              << dimSpec.iterDim
+              << " out_dim=" << dimSpec.outputDim
+              << " per_core_dma=" << splitCost.perCoreDmaInBytes << "B"
+              << " shared=" << splitCost.sharedDataBytes << "B"
+              << " split=" << splitCost.splitDataBytes << "B"
+              << " halo=" << splitCost.haloOverheadBytes << "B"
+              << " reduce=" << splitCost.needsReduce
+              << " total=" << splitCost.totalCycles;
+
+          if (splitCost.totalCycles < bestCost) {
+            bestCost = splitCost.totalCycles;
+            bestIterDim = dimSpec.iterDim;
+          }
+        }
+      } else {
+        // Fallback: use output tensor rank heuristic
+        for (unsigned outDim = 0;
+             outDim < static_cast<unsigned>(outType.getRank()); ++outDim) {
+          if (outDim >= numLoops)
+            continue;
+          if (iterTypes[outDim] == utils::IteratorType::reduction)
+            continue;
+
+          ScheduleCost cost = costModel.evaluateSpatialSplit(op, outDim, cores);
+          if (cost.totalCycles < bestCost) {
+            bestCost = cost.totalCycles;
+            bestIterDim = outDim;
+          }
         }
       }
 
-      unsigned bestIterDim = outputDimToIterDim(op, bestOutDim);
+      // Find the output dim corresponding to bestIterDim
+      unsigned bestOutDim = bestIterDim; // default
+      if (spec) {
+        for (const auto &dimSpec : spec->splitDims) {
+          if (dimSpec.iterDim == bestIterDim) {
+            if (dimSpec.outputDim < static_cast<unsigned>(outType.getRank()))
+              bestOutDim = dimSpec.outputDim;
+            break;
+          }
+        }
+      }
+
       int64_t dimSize = outType.getDimSize(bestOutDim);
       int64_t tileSize = (dimSize + cores - 1) / cores;
 
-      // Build tile sizes in iteration domain coordinates (length = numLoops)
+      // Build tile sizes in iteration domain coordinates
       SmallVector<OpFoldResult> tileSizes(numLoops,
                                            OpBuilder(op).getIndexAttr(0));
       tileSizes[bestIterDim] = OpBuilder(op).getIndexAttr(tileSize);

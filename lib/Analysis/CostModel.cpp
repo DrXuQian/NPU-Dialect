@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Analysis/CostModel.h"
+#include "npu/Analysis/OperatorTilingSpec.h"
 #include "npu/Dialect/NPU/NPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -431,6 +432,118 @@ CostModel::SpillStrategy CostModel::evaluateSpillStrategy(
   int64_t retileOverhead = dmaCycles(tileWorkingSet); // rough: one extra DMA pass
   return spillDmaCost < retileOverhead ? SpillStrategy::Spill
                                        : SpillStrategy::Retile;
+}
+
+CostModel::SpatialSplitCost CostModel::evaluateSpatialSplitDetailed(
+    Operation *op, const SplitDimSpec &dimSpec, int64_t numChunks) const {
+
+  SpatialSplitCost result;
+  result.needsReduce = !dimSpec.isParallel;
+
+  if (op->getNumResults() == 0)
+    return result;
+
+  auto outType = dyn_cast<ShapedType>(op->getResult(0).getType());
+  if (!outType || !outType.hasStaticShape())
+    return result;
+
+  // Number of active cores
+  int64_t dimSize = 1;
+  if (dimSpec.outputDim < static_cast<unsigned>(outType.getRank()))
+    dimSize = outType.getDimSize(dimSpec.outputDim);
+  int64_t activeCores = std::min(numChunks, dimSize);
+  if (activeCores <= 0)
+    return result;
+
+  int64_t perCoreDim = (dimSize + activeCores - 1) / activeCores;
+
+  // Per-core compute
+  int64_t fullCycles = computeCycles(op);
+  result.perCoreComputeCycles = (fullCycles + activeCores - 1) / activeCores;
+
+  // Per-core DMA: precisely account for each input operand
+  unsigned numInputs = 0;
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op))
+    numInputs = linalgOp.getNumDpsInputs();
+  else
+    numInputs = op->getNumOperands() > 0 ? op->getNumOperands() - 1 : 0;
+
+  for (const auto &rule : dimSpec.inputRules) {
+    if (rule.operandIdx >= op->getNumOperands())
+      continue;
+    auto operandType = dyn_cast<ShapedType>(
+        op->getOperand(rule.operandIdx).getType());
+    if (!operandType)
+      continue;
+
+    int64_t fullBytes = tensorBytes(operandType);
+
+    switch (rule.kind) {
+    case SliceKind::Shared:
+      // Each core loads the full operand — expensive!
+      result.sharedDataBytes += fullBytes;
+      result.perCoreDmaInBytes += fullBytes;
+      break;
+
+    case SliceKind::Split: {
+      // Operand is sliced along rule.sliceDim, size = perCoreDim
+      int64_t slicedBytes = fullBytes;
+      if (rule.sliceDim < static_cast<unsigned>(operandType.getRank())) {
+        int64_t origDim = operandType.getDimSize(rule.sliceDim);
+        if (origDim > 0)
+          slicedBytes = fullBytes * perCoreDim / origDim;
+      }
+      result.splitDataBytes += slicedBytes;
+      result.perCoreDmaInBytes += slicedBytes;
+      break;
+    }
+
+    case SliceKind::Halo: {
+      // Sliced with extra halo elements
+      int64_t slicedBytes = fullBytes;
+      if (rule.sliceDim < static_cast<unsigned>(operandType.getRank())) {
+        int64_t origDim = operandType.getDimSize(rule.sliceDim);
+        int64_t haloDim = perCoreDim + rule.haloLow + rule.haloHigh;
+        haloDim = std::min(haloDim, origDim); // clamp
+        if (origDim > 0) {
+          slicedBytes = fullBytes * haloDim / origDim;
+          result.haloOverheadBytes +=
+              fullBytes * (rule.haloLow + rule.haloHigh) / origDim;
+        }
+      }
+      result.splitDataBytes += slicedBytes;
+      result.perCoreDmaInBytes += slicedBytes;
+      break;
+    }
+
+    case SliceKind::Reduce:
+      // Reduction output: each core produces a partial sum
+      result.perCoreDmaInBytes += fullBytes; // full output buffer needed
+      break;
+    }
+  }
+
+  // DMA cycles
+  int64_t perCoreDmaCycles = dmaCycles(result.perCoreDmaInBytes);
+
+  // Reduction penalty: need to accumulate partial results across cores
+  int64_t reducePenalty = 0;
+  if (result.needsReduce) {
+    int64_t outBytes = tensorBytes(outType);
+    // Each core writes partial result, then reduce = (numCores-1) reads+adds
+    reducePenalty = (activeCores - 1) * dmaCycles(outBytes) +
+                    (activeCores - 1) * (outBytes / 2); // rough reduce compute
+  }
+
+  // Idle core penalty
+  int64_t idlePenalty = 0;
+  if (activeCores < numChunks)
+    idlePenalty = (numChunks - activeCores) * target_.interCoreSyncCost;
+
+  result.totalCycles = std::max(result.perCoreComputeCycles, perCoreDmaCycles) +
+                       reducePenalty + idlePenalty + target_.interCoreSyncCost;
+
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
