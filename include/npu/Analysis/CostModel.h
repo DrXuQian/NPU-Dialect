@@ -38,8 +38,8 @@ enum class InterconnectKind {
 };
 
 struct HWTarget {
-  int64_t numCores = 4;
-  int64_t sramPerCore = 256 * 1024; // bytes (core-private)
+  int64_t numCores = 6;
+  int64_t sramPerCore = 2 * 1024 * 1024; // 2MB per core (core-private)
   int64_t dramBandwidth = 32;       // GB/s
   int64_t sramBandwidth = 256;      // GB/s
   int64_t matrixThroughput = 4096;  // MACs/cycle

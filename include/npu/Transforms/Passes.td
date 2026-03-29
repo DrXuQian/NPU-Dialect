@@ -66,7 +66,7 @@ def NPUSpatialTiling : Pass<"npu-spatial-tiling", "mlir::func::FuncOp"> {
     evaluate the per-core cost of splitting along that dimension.
   }];
   let options = [
-    Option<"numCores", "num-cores", "int64_t", "4",
+    Option<"numCores", "num-cores", "int64_t", "6",
            "Number of NPU cores">,
   ];
   let dependentDialects = ["mlir::scf::SCFDialect"];
@@ -87,7 +87,7 @@ def NPUTemporalTiling : Pass<"npu-temporal-tiling", "mlir::func::FuncOp"> {
     Evaluation: num_iterations * max(DMA_in, compute) pipeline model.
   }];
   let options = [
-    Option<"sramSize", "sram-size", "int64_t", "262144",
+    Option<"sramSize", "sram-size", "int64_t", "2097152",
            "SRAM size per core in bytes">,
   ];
   let dependentDialects = ["mlir::scf::SCFDialect"];
@@ -139,7 +139,7 @@ def NPUSRAMAllocation : Pass<"npu-sram-allocation", "mlir::func::FuncOp"> {
     so SRAM allocation can be parallelized across kernels.
   }];
   let options = [
-    Option<"sramSize", "sram-size", "int64_t", "262144",
+    Option<"sramSize", "sram-size", "int64_t", "2097152",
            "SRAM size per core in bytes">,
   ];
   let dependentDialects = [
