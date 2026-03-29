@@ -53,9 +53,10 @@ static bool isComputeOp(Operation *op) {
   return isa<linalg::LinalgOp>(op);
 }
 
-/// Check if an op is a matrix-unit op (matmul or conv).
+/// Check if an op is a matrix-unit op (matmul, batch_matmul, or conv).
 static bool isMatrixOp(Operation *op) {
-  return isa<linalg::MatmulOp>(op) || isa<linalg::Conv2DNchwFchwOp>(op);
+  return isa<linalg::MatmulOp>(op) || isa<linalg::BatchMatmulOp>(op) ||
+         isa<linalg::Conv2DNchwFchwOp>(op);
 }
 
 /// Get single-use linalg consumers of an op (ops that use exactly one result

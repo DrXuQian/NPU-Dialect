@@ -164,6 +164,7 @@ RooflineCost CostModel::evaluateRoofline(Operation *op) const {
   }
 
   bool isMatrix = isa<linalg::MatmulOp>(op) ||
+                  isa<linalg::BatchMatmulOp>(op) ||
                   isa<linalg::Conv2DNchwFchwOp>(op);
   return evaluateRooflineRaw(flops, memBytes, isMatrix);
 }
@@ -844,6 +845,7 @@ CostModel::SubgraphCost CostModel::evaluateSubgraph(
   // Classify each op's compute cycles into matrix or DSP.
   for (Operation *op : ops) {
     bool isMatrix = isa<linalg::MatmulOp>(op) ||
+                    isa<linalg::BatchMatmulOp>(op) ||
                     isa<linalg::Conv2DNchwFchwOp>(op);
     int64_t cycles = computeCycles(op);
     if (isMatrix)

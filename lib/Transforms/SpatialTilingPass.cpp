@@ -49,7 +49,8 @@ struct NPUSpatialTilingPass
     funcOp.walk([&](linalg::LinalgOp op) {
       if (!op->getParentOfType<scf::ForOp>() &&
           !op->getParentOfType<scf::ForallOp>()) {
-        if (isa<linalg::MatmulOp, linalg::Conv2DNchwFchwOp,
+        if (isa<linalg::MatmulOp, linalg::BatchMatmulOp,
+                linalg::Conv2DNchwFchwOp,
                 linalg::GenericOp>(op.getOperation()))
           ops.push_back(op);
       }
