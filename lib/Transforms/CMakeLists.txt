@@ -4,6 +4,7 @@ add_mlir_library(NPUTransforms
   SpatialTilingPass.cpp
   TemporalTilingPass.cpp
   BufferizePass.cpp
+  SRAMAllocationPass.cpp
   SpillHandlingPass.cpp
   Pipeline.cpp
 

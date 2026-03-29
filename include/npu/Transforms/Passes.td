@@ -113,17 +113,39 @@ def NPUBufferize : Pass<"npu-bufferize", "mlir::ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Pass 5: Spill handling
+// Pass 5: SRAM Allocation (address planning + spill-via-DMA)
 //===----------------------------------------------------------------------===//
 
-def NPUSpillHandling : Pass<"npu-spill-handling", "mlir::func::FuncOp"> {
-  let summary = "Handle SRAM overflow via retiling or spilling to DRAM";
+def NPUSRAMAllocation : Pass<"npu-sram-allocation", "mlir::func::FuncOp"> {
+  let summary = "Plan SRAM addresses and insert DMA for spill/reload";
   let description = [{
-    If any tile's working set exceeds SRAM after allocation:
-    1. Re-tile with smaller tile sizes (CostModel.evaluateSpillStrategy)
-    2. Spill intermediates to DRAM with explicit DMA
+    Unified SRAM address planning for each kernel function.
+
+    Invariant: SRAM is empty at kernel entry and exit.
+
+    Address layout (dual-end):
+      [0 ── inputs → ]  [ ← intermediates → ]  [ ← outputs ── SRAM_SIZE]
+    Inputs grow from address 0 upward, outputs from SRAM_SIZE downward.
+    Intermediates fill the gap in the middle.
+
+    When total working set exceeds SRAM:
+      - Evict the largest dead-at-this-point tensor to DDR:
+        insert `npu.dma_copy` (S2D) after last use
+      - Reload before next use:
+        insert `npu.dma_copy` (D2S) before consumer
+      - A DDR shadow buffer (`memref.alloc`) is created for each evicted tensor
+
+    Each outlined `npu.fused_kernel` function is planned independently,
+    so SRAM allocation can be parallelized across kernels.
   }];
-  let dependentDialects = ["npu::NPUDialect"];
+  let options = [
+    Option<"sramSize", "sram-size", "int64_t", "262144",
+           "SRAM size per core in bytes">,
+  ];
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect",
+    "npu::NPUDialect",
+  ];
 }
 
 #endif // NPU_TRANSFORMS_PASSES_TD
