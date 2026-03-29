@@ -29,9 +29,17 @@ struct OperatorTilingSpec;
 // Hardware target descriptor
 //===----------------------------------------------------------------------===//
 
+/// Inter-core interconnect type.
+enum class InterconnectKind {
+  NoC,        // Direct tile-to-tile network (low latency, on-chip)
+  SharedL1,   // Shared L1 cache (hardware coherence, ≈free)
+  SharedSRAM, // Shared addressable SRAM across cores
+  DRAMOnly,   // No fast inter-core path; must go through DRAM
+};
+
 struct HWTarget {
   int64_t numCores = 4;
-  int64_t sramPerCore = 256 * 1024; // bytes
+  int64_t sramPerCore = 256 * 1024; // bytes (core-private)
   int64_t dramBandwidth = 32;       // GB/s
   int64_t sramBandwidth = 256;      // GB/s
   int64_t matrixThroughput = 4096;  // MACs/cycle
@@ -40,7 +48,31 @@ struct HWTarget {
   int64_t interCoreSyncCost = 100;  // cycles
   double clockGHz = 1.0;
 
+  // Inter-core interconnect
+  InterconnectKind interconnect = InterconnectKind::NoC;
+  int64_t nocBandwidth = 128;       // GB/s (for NoC)
+  int64_t nocLatencyCycles = 10;    // per-hop latency
+  int64_t sharedL1Size = 0;         // bytes (for SharedL1/SharedSRAM)
+
   double bytesPerCycle() const { return dramBandwidth / clockGHz; }
+  double nocBytesPerCycle() const { return nocBandwidth / clockGHz; }
+
+  /// Cost of inter-core data transfer (spatial tiling boundary).
+  /// Returns cycles to move `bytes` between two cores.
+  int64_t interCoreTransferCycles(int64_t bytes) const {
+    switch (interconnect) {
+    case InterconnectKind::NoC:
+      return nocLatencyCycles +
+             std::max<int64_t>(1, static_cast<int64_t>(bytes / nocBytesPerCycle()));
+    case InterconnectKind::SharedL1:
+    case InterconnectKind::SharedSRAM:
+      return 1; // essentially free (hardware-managed)
+    case InterconnectKind::DRAMOnly:
+      // Must go through DRAM: write + read
+      return 2 * std::max<int64_t>(1, static_cast<int64_t>(bytes / bytesPerCycle()));
+    }
+    return 0;
+  }
 };
 
 //===----------------------------------------------------------------------===//
