@@ -98,6 +98,7 @@ struct NPUCostEvaluatePass
     // --- Accumulate compute by engine ---
     funcOp.walk([&](linalg::LinalgOp op) {
       bool isMatrix = isa<linalg::MatmulOp>(op.getOperation()) ||
+                      isa<linalg::BatchMatmulOp>(op.getOperation()) ||
                       isa<linalg::Conv2DNchwFchwOp>(op.getOperation());
       int64_t cycles = costModel.computeCycles(op);
       if (isMatrix)

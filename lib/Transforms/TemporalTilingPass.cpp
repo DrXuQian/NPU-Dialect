@@ -268,7 +268,7 @@ struct NPUTemporalTilingPass
     SmallVector<linalg::LinalgOp> targets;
     funcOp.walk([&](linalg::LinalgOp op) {
       if (isa<linalg::MatmulOp, linalg::BatchMatmulOp,
-              linalg::Conv2DNchwFchwOp,
+              linalg::Conv2DNchwFchwOp, linalg::TransposeOp,
               linalg::GenericOp>(op.getOperation()))
         targets.push_back(op);
     });

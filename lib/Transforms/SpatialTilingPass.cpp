@@ -50,7 +50,7 @@ struct NPUSpatialTilingPass
       if (!op->getParentOfType<scf::ForOp>() &&
           !op->getParentOfType<scf::ForallOp>()) {
         if (isa<linalg::MatmulOp, linalg::BatchMatmulOp,
-                linalg::Conv2DNchwFchwOp,
+                linalg::Conv2DNchwFchwOp, linalg::TransposeOp,
                 linalg::GenericOp>(op.getOperation()))
           ops.push_back(op);
       }
