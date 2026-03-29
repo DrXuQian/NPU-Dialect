@@ -188,19 +188,89 @@ OperatorTilingSpec npu::getElementwiseTilingSpec(unsigned rank) {
     s.outputDim = dim;
     s.iterDim = dim;
     s.isParallel = true;
-    // All operands split on the same dimension (pointwise)
     s.inputRules = {
         {0, SliceKind::Split, dim},
     };
     s.outputRules = {
         {0, SliceKind::Split, dim},
     };
-    s.reuseRatio = 1.0; // no reuse — all data unique
+    s.reuseRatio = 1.0;
     spec.splitDims.push_back(s);
   }
 
   spec.preferredSpatialDim = 0;
   spec.preferredTemporalDims = {0};
+
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
+// Generic op with mixed parallel/reduction iterators
+// (e.g., softmax, layernorm, reduce_sum)
+//===----------------------------------------------------------------------===//
+
+OperatorTilingSpec npu::getGenericTilingSpec(
+    llvm::ArrayRef<mlir::utils::IteratorType> iterTypes,
+    unsigned outputRank) {
+  OperatorTilingSpec spec;
+
+  // Classify the generic op by its iterator pattern
+  unsigned numParallel = 0, numReduction = 0;
+  for (auto t : iterTypes) {
+    if (t == utils::IteratorType::parallel)
+      numParallel++;
+    else
+      numReduction++;
+  }
+
+  if (numReduction == 0) {
+    spec.opName = "linalg.generic (elementwise)";
+  } else if (numParallel > 0 && numReduction > 0) {
+    spec.opName = "linalg.generic (mixed par/red)";
+  } else {
+    spec.opName = "linalg.generic (full reduction)";
+  }
+
+  // Build split dim specs from iterator types
+  unsigned outDimIdx = 0;
+  for (unsigned dim = 0; dim < iterTypes.size(); ++dim) {
+    SplitDimSpec s;
+    s.iterDim = dim;
+    s.isParallel = (iterTypes[dim] == utils::IteratorType::parallel);
+
+    if (s.isParallel && outDimIdx < outputRank) {
+      s.outputDim = outDimIdx;
+      outDimIdx++;
+      // Parallel dim: all operands split
+      s.inputRules = {{0, SliceKind::Split, s.outputDim}};
+      s.outputRules = {{0, SliceKind::Split, s.outputDim}};
+      s.reuseRatio = 1.0;
+    } else {
+      // Reduction dim: output doesn't have this dim, inputs are split,
+      // output needs Reduce (partial sums accumulated)
+      s.outputDim = UINT_MAX; // not an output dimension
+      s.inputRules = {{0, SliceKind::Split, dim < outputRank ? dim : 0}};
+      s.outputRules = {{0, SliceKind::Reduce, 0}};
+      s.reuseRatio = 1.0;
+    }
+
+    spec.splitDims.push_back(s);
+  }
+
+  // Preferred dims: only parallel dims are safe for spatial tiling
+  // For temporal tiling: parallel dims first, then reduction dims
+  for (unsigned dim = 0; dim < iterTypes.size(); ++dim) {
+    if (iterTypes[dim] == utils::IteratorType::parallel) {
+      if (spec.preferredSpatialDim == -1)
+        spec.preferredSpatialDim = dim;
+      spec.preferredTemporalDims.push_back(dim);
+    }
+  }
+  // Reduction dims go last in temporal search
+  for (unsigned dim = 0; dim < iterTypes.size(); ++dim) {
+    if (iterTypes[dim] == utils::IteratorType::reduction)
+      spec.preferredTemporalDims.push_back(dim);
+  }
 
   return spec;
 }
@@ -326,18 +396,32 @@ const OperatorTilingSpec *npu::getTilingSpec(Operation *op) {
     return &convSpec;
   }
 
-  // Generic/elementwise
+  // Generic: build spec from iterator_types
+  // - Pure elementwise (all parallel): relu, sigmoid, add, etc.
+  // - Mixed parallel+reduction: softmax, layernorm, reduce_sum, etc.
+  // - The spec correctly marks reduction dims as non-splittable for spatial tiling
   if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
-    auto iterTypes = genericOp.getIteratorTypesArray();
-    bool allParallel = llvm::all_of(iterTypes, [](auto t) {
-      return t == utils::IteratorType::parallel;
-    });
-    if (allParallel && genericOp.getNumResults() > 0) {
+    if (genericOp.getNumResults() > 0) {
+      auto iterTypes = genericOp.getIteratorTypesArray();
       auto outType = cast<ShapedType>(genericOp.getResult(0).getType());
-      static OperatorTilingSpec ewSpec = getElementwiseTilingSpec(outType.getRank());
-      return &ewSpec;
+      // Cache by (numIters, numParallel) signature — good enough for most cases
+      // Use thread_local to avoid static init issues
+      thread_local llvm::DenseMap<uint64_t, OperatorTilingSpec> genericSpecCache;
+      uint64_t key = (uint64_t(iterTypes.size()) << 32) | outType.getRank();
+      // Also encode parallel/reduction pattern
+      for (unsigned i = 0; i < iterTypes.size() && i < 8; ++i) {
+        if (iterTypes[i] == utils::IteratorType::reduction)
+          key |= (1ULL << (16 + i));
+      }
+      auto it = genericSpecCache.find(key);
+      if (it == genericSpecCache.end()) {
+        auto spec = getGenericTilingSpec(iterTypes, outType.getRank());
+        it = genericSpecCache.try_emplace(key, std::move(spec)).first;
+      }
+      return &it->second;
     }
   }
 
+  // Fallback: try building from indexing maps
   return nullptr;
 }

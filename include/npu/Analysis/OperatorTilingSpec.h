@@ -27,6 +27,7 @@
 
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include <cstdint>
@@ -119,6 +120,11 @@ OperatorTilingSpec getConv2dNchwTilingSpec(int64_t Kh, int64_t Kw,
 
 /// elementwise (generic with all parallel iterators)
 OperatorTilingSpec getElementwiseTilingSpec(unsigned rank);
+
+/// generic op with mixed parallel/reduction iterators (softmax, layernorm, etc.)
+OperatorTilingSpec getGenericTilingSpec(
+    llvm::ArrayRef<mlir::utils::IteratorType> iterTypes,
+    unsigned outputRank);
 
 } // namespace npu
 
