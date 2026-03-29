@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include <limits>
 
 namespace npu {
@@ -320,6 +321,15 @@ struct NPUTemporalTilingPass
                             tilingOptions);
       if (succeeded(tilingResult)) {
         rewriter.replaceOp(op, tilingResult->replacements);
+
+        // Peel remainder iterations to keep all shapes static.
+        for (auto loop : tilingResult->loops) {
+          if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation())) {
+            scf::ForOp partialIteration;
+            (void)scf::peelForLoopAndSimplifyBounds(rewriter, forOp,
+                                                     partialIteration);
+          }
+        }
       }
     }
   }
