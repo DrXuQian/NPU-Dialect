@@ -12,6 +12,7 @@
 #include "npu/Dialect/NPU/NPUDialect.h"
 #include "npu/Transforms/Passes.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -33,6 +34,7 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
 
   // Register standard dialects
+  registry.insert<mlir::affine::AffineDialect>();
   registry.insert<mlir::arith::ArithDialect>();
   registry.insert<mlir::bufferization::BufferizationDialect>();
   registry.insert<mlir::func::FuncDialect>();

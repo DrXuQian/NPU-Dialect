@@ -11,9 +11,9 @@ using namespace mlir;
 void npu::registerNPUPipeline() {
   PassPipelineRegistration<>(
       "npu-pipeline",
-      "Full NPU compilation pipeline",
+      "Full NPU compilation pipeline (all static shapes)",
       [](OpPassManager &pm) {
-        // Pass 1: Cost-model driven fusion
+        // Pass 1: Cost-model driven greedy fusion
         pm.addNestedPass<func::FuncOp>(npu::createNPUFusion());
         // Pass 1b: Outline fused subgraphs into kernel functions
         pm.addPass(npu::createNPUOutlineFusedGroups());
@@ -21,17 +21,16 @@ void npu::registerNPUPipeline() {
         pm.addNestedPass<func::FuncOp>(npu::createNPUSpatialTiling());
         // Pass 2b: Core mapping
         pm.addNestedPass<func::FuncOp>(npu::createNPUCoreMapping());
-        // Pass 3: Temporal tiling (with loop peeling)
+        // Pass 3: Temporal tiling (spec-driven, with loop peeling)
         pm.addNestedPass<func::FuncOp>(npu::createNPUTemporalTiling());
-        // Canonicalize + CSE: fold affine constants from peeling,
-        // ensure all shapes are static before bufferize.
-        pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-        pm.addNestedPass<func::FuncOp>(createCSEPass());
+        // Fold affine constants from peeling → all shapes static
+        pm.addPass(createCanonicalizerPass());
+        pm.addPass(createCSEPass());
         // Pass 4: Bufferize (tensor → memref + npu.alloc_sram + npu.dma_copy)
         pm.addPass(npu::createNPUBufferize());
-        // Pass 5: SRAM allocation
+        // Pass 5: SRAM allocation (dual-end, spill via DMA)
         pm.addNestedPass<func::FuncOp>(npu::createNPUSRAMAllocation());
-        // Pass 6: Cost evaluation
+        // Pass 6: Cost evaluation (roofline, does not modify IR)
         pm.addNestedPass<func::FuncOp>(npu::createNPUCostEvaluate());
       });
 }
