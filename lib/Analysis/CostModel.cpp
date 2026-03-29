@@ -87,6 +87,118 @@ int64_t CostModel::tensorBytes(ShapedType type) {
 }
 
 //===----------------------------------------------------------------------===//
+// Roofline model
+//===----------------------------------------------------------------------===//
+
+RooflineCost CostModel::evaluateRooflineRaw(
+    double flops, double memBytes, bool useMatrixUnit) const {
+  RooflineCost cost;
+  cost.flops = flops;
+  cost.memBytes = memBytes;
+
+  // Peak hardware capabilities
+  double peakFLOPS = useMatrixUnit
+      ? static_cast<double>(target_.matrixThroughput) * target_.clockGHz * 1e9
+      : static_cast<double>(target_.dspThroughput) * target_.clockGHz * 1e9;
+  double peakBW = static_cast<double>(target_.dramBandwidth) * 1e9; // bytes/sec
+
+  // Arithmetic intensity = FLOPs / Bytes
+  cost.arithmeticIntensity = (memBytes > 0) ? flops / memBytes : 1e12;
+
+  // Roofline ridge point
+  double ridgePoint = peakFLOPS / peakBW;
+
+  // Attainable performance
+  cost.peakAttainable = std::min(peakFLOPS,
+                                  cost.arithmeticIntensity * peakBW);
+
+  // Time = max(compute_time, memory_time)
+  double computeTime = (peakFLOPS > 0) ? flops / peakFLOPS : 0;
+  double memoryTime = (peakBW > 0) ? memBytes / peakBW : 0;
+  cost.timeSec = std::max(computeTime, memoryTime);
+  cost.isMemoryBound = (cost.arithmeticIntensity < ridgePoint);
+  cost.efficiency = (peakFLOPS > 0 && cost.timeSec > 0)
+      ? (flops / cost.timeSec) / peakFLOPS : 0;
+
+  return cost;
+}
+
+RooflineCost CostModel::evaluateRoofline(Operation *op) const {
+  double flops = static_cast<double>(opMACs(op)) * 2.0; // MAC = 2 FLOPs
+
+  // Memory: all input + output bytes (each goes to/from DRAM once)
+  double memBytes = 0;
+  for (auto operand : op->getOperands()) {
+    if (auto type = dyn_cast<ShapedType>(operand.getType()))
+      memBytes += tensorBytes(type);
+  }
+  for (auto result : op->getResults()) {
+    if (auto type = dyn_cast<ShapedType>(result.getType()))
+      memBytes += tensorBytes(type);
+  }
+
+  bool isMatrix = isa<linalg::MatmulOp>(op) ||
+                  isa<linalg::Conv2DNchwFchwOp>(op);
+  return evaluateRooflineRaw(flops, memBytes, isMatrix);
+}
+
+RooflineCost CostModel::evaluateRoofline(
+    llvm::ArrayRef<Operation *> ops) const {
+  if (ops.empty())
+    return {};
+
+  // Aggregate FLOPs
+  double totalFlops = 0;
+  for (auto *op : ops)
+    totalFlops += static_cast<double>(opMACs(op)) * 2.0;
+
+  // For memory: only count EXTERNAL data (not intermediates).
+  // Intermediates stay in SRAM → no DRAM access.
+  llvm::DenseSet<Value> producedValues;
+  llvm::DenseSet<Operation *> opSet(ops.begin(), ops.end());
+  for (auto *op : ops)
+    for (auto result : op->getResults())
+      producedValues.insert(result);
+
+  double externalMemBytes = 0;
+
+  // External inputs
+  for (auto *op : ops) {
+    for (auto operand : op->getOperands()) {
+      if (!producedValues.contains(operand)) {
+        if (auto type = dyn_cast<ShapedType>(operand.getType()))
+          externalMemBytes += tensorBytes(type);
+      }
+    }
+  }
+  // External outputs (used outside subgraph or last op's results)
+  for (auto *op : ops) {
+    for (auto result : op->getResults()) {
+      bool usedOutside = false;
+      for (auto *user : result.getUsers()) {
+        if (!opSet.contains(user)) {
+          usedOutside = true;
+          break;
+        }
+      }
+      if (usedOutside || result.getUses().empty()) {
+        if (auto type = dyn_cast<ShapedType>(result.getType()))
+          externalMemBytes += tensorBytes(type);
+      }
+    }
+  }
+
+  // Determine dominant unit
+  bool hasMatrix = false;
+  for (auto *op : ops) {
+    if (isa<linalg::MatmulOp>(op) || isa<linalg::Conv2DNchwFchwOp>(op))
+      hasMatrix = true;
+  }
+
+  return evaluateRooflineRaw(totalFlops, externalMemBytes, hasMatrix);
+}
+
+//===----------------------------------------------------------------------===//
 // Level 1 — tile configuration evaluation
 //===----------------------------------------------------------------------===//
 

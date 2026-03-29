@@ -90,6 +90,18 @@ struct ScheduleCost {
   bool isValid() const { return totalCycles < INT64_MAX / 2; }
 };
 
+/// Roofline-based cost: the ground truth cost model.
+/// For each op/subgraph, determines if it's compute-bound or memory-bound.
+struct RooflineCost {
+  double flops = 0;                // total floating-point operations
+  double memBytes = 0;             // total DRAM bytes accessed (external only)
+  double arithmeticIntensity = 0;  // flops / memBytes (FLOP/byte)
+  double timeSec = 0;              // estimated wall time
+  bool isMemoryBound = true;       // true if bottleneck is memory BW
+  double peakAttainable = 0;       // attainable FLOP/s under roofline
+  double efficiency = 0;           // actual / peak (0..1)
+};
+
 struct FusionDecision {
   bool shouldFuse = false;
   int64_t benefitCycles = 0; // positive = fusing is cheaper
@@ -125,6 +137,22 @@ public:
 
   /// Byte size of a shaped type (tensor or memref).
   static int64_t tensorBytes(mlir::ShapedType type);
+
+  // ================================================================
+  // Roofline model: ground truth cost evaluation
+  // ================================================================
+
+  /// Evaluate a single op using roofline model.
+  /// Determines if it's compute-bound or memory-bound on the target hardware.
+  RooflineCost evaluateRoofline(mlir::Operation *op) const;
+
+  /// Evaluate a fused subgraph using roofline model.
+  /// Intermediates stay in SRAM → reduced memBytes → higher arithmetic intensity.
+  RooflineCost evaluateRoofline(llvm::ArrayRef<mlir::Operation *> ops) const;
+
+  /// Evaluate roofline from raw FLOPs and memory bytes (for lowered IR).
+  RooflineCost evaluateRooflineRaw(double flops, double memBytes,
+                                    bool useMatrixUnit = true) const;
 
   // ================================================================
   // Level 1: Tile configuration evaluation

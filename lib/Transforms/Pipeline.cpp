@@ -27,5 +27,7 @@ void npu::registerNPUPipeline() {
         //   Inputs from low end, outputs from high end.
         //   Overflow → evict to DDR + DMA reload.
         pm.addNestedPass<func::FuncOp>(npu::createNPUSRAMAllocation());
+        // Pass 6 (analysis): Roofline cost evaluation (does not modify IR)
+        pm.addNestedPass<func::FuncOp>(npu::createNPUCostEvaluate());
       });
 }

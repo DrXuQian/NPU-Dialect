@@ -148,4 +148,25 @@ def NPUSRAMAllocation : Pass<"npu-sram-allocation", "mlir::func::FuncOp"> {
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// Pass 6 (analysis): Cost evaluation of lowered IR
+//===----------------------------------------------------------------------===//
+
+def NPUCostEvaluate : Pass<"npu-cost-evaluate", "mlir::func::FuncOp"> {
+  let summary = "Evaluate execution cost of IR using roofline model";
+  let description = [{
+    Walks the function body and computes cost metrics:
+    - Per-op: FLOPs, memory bytes, arithmetic intensity, roofline time
+    - Per-kernel: 3-engine pipeline cost with DMA/matrix/DSP overlap
+    - Overall: total time, peak SRAM, bottleneck analysis
+
+    Emits cost breakdown as JSON to stderr (parseable by harness).
+    Does NOT modify the IR.
+  }];
+  let dependentDialects = [
+    "npu::NPUDialect",
+    "mlir::scf::SCFDialect",
+  ];
+}
+
 #endif // NPU_TRANSFORMS_PASSES_TD
