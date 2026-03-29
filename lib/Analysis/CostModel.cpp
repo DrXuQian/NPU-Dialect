@@ -24,26 +24,45 @@ static constexpr int64_t kInfCycles = std::numeric_limits<int64_t>::max() / 2;
 // Level 0 — hardware primitive queries
 //===----------------------------------------------------------------------===//
 
+/// Safe product of shape dimensions, treating dynamic dims as 1.
+static int64_t safeShapeProduct(ShapedType type) {
+  if (!type.hasStaticShape()) {
+    int64_t prod = 1;
+    for (int64_t d : type.getShape())
+      prod *= (d >= 0 ? d : 1); // kDynamic is negative
+    return prod;
+  }
+  int64_t prod = 1;
+  for (int64_t d : type.getShape())
+    prod *= d;
+  return prod;
+}
+
+static int64_t safeDim(ShapedType type, unsigned dim) {
+  int64_t d = type.getDimSize(dim);
+  return d >= 0 ? d : 1; // kDynamic → 1
+}
+
 int64_t CostModel::opMACs(Operation *op) const {
   if (auto matmul = dyn_cast<linalg::MatmulOp>(op)) {
     auto outType = cast<ShapedType>(matmul.getResult(0).getType());
     auto lhsType = cast<ShapedType>(matmul.getInputs()[0].getType());
-    int64_t M = outType.getDimSize(0);
-    int64_t N = outType.getDimSize(1);
-    int64_t K = lhsType.getDimSize(1);
+    int64_t M = safeDim(outType, 0);
+    int64_t N = safeDim(outType, 1);
+    int64_t K = safeDim(lhsType, 1);
     return M * N * K;
   }
 
   if (auto conv = dyn_cast<linalg::Conv2DNchwFchwOp>(op)) {
     auto outType = cast<ShapedType>(conv.getResult(0).getType());
     auto filterType = cast<ShapedType>(conv.getInputs()[1].getType());
-    int64_t N = outType.getDimSize(0);
-    int64_t Co = outType.getDimSize(1);
-    int64_t Ho = outType.getDimSize(2);
-    int64_t Wo = outType.getDimSize(3);
-    int64_t Ci = filterType.getDimSize(1);
-    int64_t Kh = filterType.getDimSize(2);
-    int64_t Kw = filterType.getDimSize(3);
+    int64_t N = safeDim(outType, 0);
+    int64_t Co = safeDim(outType, 1);
+    int64_t Ho = safeDim(outType, 2);
+    int64_t Wo = safeDim(outType, 3);
+    int64_t Ci = safeDim(filterType, 1);
+    int64_t Kh = safeDim(filterType, 2);
+    int64_t Kw = safeDim(filterType, 3);
     return N * Co * Ho * Wo * Ci * Kh * Kw;
   }
 
@@ -51,9 +70,7 @@ int64_t CostModel::opMACs(Operation *op) const {
   if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
     if (generic.getNumResults() > 0) {
       auto outType = cast<ShapedType>(generic.getResult(0).getType());
-      int64_t elems = 1;
-      for (int64_t d : outType.getShape())
-        elems *= d;
+      int64_t elems = safeShapeProduct(outType);
       return elems;
     }
   }
@@ -77,11 +94,9 @@ int64_t CostModel::dmaCycles(int64_t bytes) const {
 }
 
 int64_t CostModel::tensorBytes(ShapedType type) {
-  if (!type.hasStaticShape())
-    return 0;
   int64_t elems = 1;
   for (int64_t d : type.getShape())
-    elems *= d;
+    elems *= (d >= 0 ? d : 1); // kDynamic → 1
   int64_t bitWidth = type.getElementTypeBitWidth();
   return elems * std::max<int64_t>(1, bitWidth / 8);
 }

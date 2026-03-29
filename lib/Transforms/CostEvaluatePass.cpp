@@ -149,8 +149,12 @@ struct NPUCostEvaluatePass
     json["sram_budget"] = costModel.target().sramPerCore;
     json["bottleneck"] = kc.isMemoryBound ? "memory" : "compute";
 
-    llvm::errs() << "COST_JSON: "
-                 << llvm::json::Value(std::move(json)) << "\n";
+    // Build the full line as a string first, then write atomically
+    // to avoid interleaving when multiple FuncOps are processed.
+    std::string jsonLine;
+    llvm::raw_string_ostream os(jsonLine);
+    os << "COST_JSON: " << llvm::json::Value(std::move(json)) << "\n";
+    llvm::errs() << jsonLine;
 
     // --- Also emit as remark on the function ---
     funcOp->emitRemark("roofline: ")
