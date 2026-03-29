@@ -9,6 +9,7 @@
 
 #include "npu/Transforms/Passes.h"
 #include "npu/Analysis/CostModel.h"
+#include "npu/Analysis/OperatorTilingSpec.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
@@ -148,8 +149,17 @@ struct NPUOutlineFusedGroupsPass
         SmallVector<Operation *> candidateGroup = {producer, consumer};
         FusionDecision decision =
             costModel.isSubgraphFusionProfitable(candidateGroup);
-        if (decision.shouldFuse)
-          uf.unite(producer, consumer);
+        if (!decision.shouldFuse)
+          continue;
+
+        // Check tile alignment: skip fusion if alignment overhead is too large.
+        auto alignment = costModel.checkTileAlignment(candidateGroup);
+        if (!alignment.aligned &&
+            alignment.alignmentOverheadBytes >
+                costModel.target().sramPerCore / 4)
+          continue;
+
+        uf.unite(producer, consumer);
       }
     }
 

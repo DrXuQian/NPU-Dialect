@@ -7,6 +7,9 @@ target_link_libraries(npu-opt PRIVATE
   NPUDialect
   NPUAnalysis
   NPUTransforms
+  NPUAnalysis
+  NPUDialect
+  NPUTransforms
 )
 
 llvm_update_compile_flags(npu-opt)

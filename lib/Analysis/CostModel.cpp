@@ -553,6 +553,117 @@ ScheduleCost CostModel::evaluateSpatialSplit(
   };
 }
 
+CostModel::TileAlignmentResult CostModel::checkTileAlignment(
+    llvm::ArrayRef<Operation *> ops) const {
+  TileAlignmentResult result;
+  result.aligned = true;
+  result.alignmentOverheadBytes = 0;
+
+  if (ops.size() <= 1)
+    return result;
+
+  // Check each adjacent producer->consumer pair.
+  for (size_t i = 0; i + 1 < ops.size(); ++i) {
+    Operation *producer = ops[i];
+    Operation *consumer = ops[i + 1];
+
+    // Find the connecting value: a producer result used by the consumer.
+    Value connecting;
+    for (Value res : producer->getResults()) {
+      for (Operation *user : res.getUsers()) {
+        if (user == consumer) {
+          connecting = res;
+          break;
+        }
+      }
+      if (connecting)
+        break;
+    }
+
+    // If there's no direct connection, the pair is trivially compatible
+    // (they may be connected through an intermediate op not in our list).
+    if (!connecting)
+      continue;
+
+    // Get tiling specs for both ops.
+    const OperatorTilingSpec *producerSpec = getTilingSpec(producer);
+    const OperatorTilingSpec *consumerSpec = getTilingSpec(consumer);
+
+    // If either spec is unavailable, assume aligned (be conservative and
+    // allow fusion to proceed).
+    if (!producerSpec || !consumerSpec)
+      continue;
+
+    // Get the type of the connecting tensor.
+    auto connectingType = dyn_cast<ShapedType>(connecting.getType());
+    if (!connectingType || !connectingType.hasStaticShape())
+      continue;
+
+    // Check: do the producer's output shape and the consumer's input shape
+    // match in type and rank? The connecting value IS the producer's output
+    // and the consumer's input, so check that the consumer uses it as-is.
+    // Find which consumer operand this corresponds to.
+    ShapedType consumerInputType = connectingType; // same value
+    ShapedType producerOutputType = connectingType;
+
+    // If shapes are the same type and rank, they're aligned for this pair.
+    // (The connecting value is literally the same SSA value, so shapes match
+    // by construction. But the tiling specs may want different tile
+    // granularities on different dims.)
+
+    // Check preferred temporal dim compatibility: if both specs tile a
+    // dimension of the connecting tensor differently, there's overhead.
+    // For example, if the producer tiles output dim 0 and the consumer
+    // tiles input dim 0 at different granularities.
+
+    // Compare the rank and shape of the producer output with what the
+    // consumer expects. For the connecting tensor, these are identical,
+    // but we check if the overall output of consumer differs in rank/shape
+    // (e.g., pooling halves spatial dims).
+    if (consumer->getNumResults() == 0)
+      continue;
+
+    auto consumerOutType =
+        dyn_cast<ShapedType>(consumer->getResult(0).getType());
+    if (!consumerOutType || !consumerOutType.hasStaticShape())
+      continue;
+
+    // If producer output rank != consumer output rank, there's a shape
+    // transformation happening → potential alignment issue.
+    if (producerOutputType.getRank() != consumerOutType.getRank()) {
+      // Rank mismatch: compute overhead as the full connecting tensor size.
+      result.aligned = false;
+      result.alignmentOverheadBytes += tensorBytes(connectingType);
+      continue;
+    }
+
+    // Check each dimension: if consumer output is smaller than producer
+    // output on any dim, there's a reduction (e.g., pooling).
+    for (int64_t d = 0; d < producerOutputType.getRank(); ++d) {
+      int64_t prodDim = producerOutputType.getDimSize(d);
+      int64_t consDim = consumerOutType.getDimSize(d);
+      if (prodDim != consDim && prodDim > 0 && consDim > 0) {
+        // Dimension mismatch: the tile boundaries won't align perfectly.
+        // Overhead = extra bytes that need to be buffered for the mismatch.
+        int64_t elemBytes =
+            std::max<int64_t>(1, connectingType.getElementTypeBitWidth() / 8);
+        int64_t totalElems = 1;
+        for (int64_t dd = 0; dd < connectingType.getRank(); ++dd)
+          totalElems *= connectingType.getDimSize(dd);
+        // Overhead is proportional to the dimension ratio difference.
+        double ratio = static_cast<double>(std::max(prodDim, consDim)) /
+                       std::min(prodDim, consDim);
+        int64_t overhead =
+            static_cast<int64_t>((ratio - 1.0) * totalElems * elemBytes);
+        result.alignmentOverheadBytes += overhead;
+        result.aligned = false;
+      }
+    }
+  }
+
+  return result;
+}
+
 CostModel::SpillStrategy CostModel::evaluateSpillStrategy(
     int64_t tileWorkingSet, int64_t intermediateBytes) const {
   int64_t spillDmaCost = 2 * dmaCycles(intermediateBytes);

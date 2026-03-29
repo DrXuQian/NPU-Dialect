@@ -8,6 +8,7 @@
 
 #include "npu/Transforms/Passes.h"
 #include "npu/Analysis/CostModel.h"
+#include "npu/Analysis/OperatorTilingSpec.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -57,6 +58,15 @@ struct NPUFusionPass : public npu::impl::NPUFusionBase<NPUFusionPass> {
           FusionDecision decision =
               costModel.isFusionProfitable(producer, consumer);
           if (!decision.shouldFuse)
+            continue;
+
+          // Check tile alignment before adding to candidates.
+          SmallVector<Operation *> pair = {producer.getOperation(),
+                                           consumer.getOperation()};
+          auto alignment = costModel.checkTileAlignment(pair);
+          if (!alignment.aligned &&
+              alignment.alignmentOverheadBytes >
+                  costModel.target().sramPerCore / 4)
             continue;
 
           candidates.push_back(
@@ -152,6 +162,15 @@ struct NPUFusionPass : public npu::impl::NPUFusionBase<NPUFusionPass> {
             FusionDecision decision =
                 costModel.isFusionProfitable(producer, consumer);
             if (!decision.shouldFuse)
+              continue;
+
+            // Check tile alignment before fusing.
+            SmallVector<Operation *> pair = {producer.getOperation(),
+                                             consumer.getOperation()};
+            auto alignment = costModel.checkTileAlignment(pair);
+            if (!alignment.aligned &&
+                alignment.alignmentOverheadBytes >
+                    costModel.target().sramPerCore / 4)
               continue;
 
             // fuseElementwiseOps requires both producer and consumer to be

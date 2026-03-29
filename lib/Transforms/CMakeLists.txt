@@ -2,6 +2,7 @@ add_mlir_library(NPUTransforms
   FusionPass.cpp
   OutlineFusedGroupsPass.cpp
   SpatialTilingPass.cpp
+  CoreMappingPass.cpp
   TemporalTilingPass.cpp
   BufferizePass.cpp
   SRAMAllocationPass.cpp

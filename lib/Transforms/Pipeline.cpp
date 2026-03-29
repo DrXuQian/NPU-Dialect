@@ -18,6 +18,8 @@ void npu::registerNPUPipeline() {
         pm.addPass(npu::createNPUOutlineFusedGroups());
         // Pass 2: Spatial tiling — distribute across cores (FuncOp)
         pm.addNestedPass<func::FuncOp>(npu::createNPUSpatialTiling());
+        // Pass 2b: Core mapping — make spatial core assignment explicit
+        pm.addNestedPass<func::FuncOp>(npu::createNPUCoreMapping());
         // Pass 3: Temporal tiling — fit SRAM with double buffering (FuncOp)
         pm.addNestedPass<func::FuncOp>(npu::createNPUTemporalTiling());
         // Pass 4: Bufferize — tensor → memref + npu.alloc_sram + npu.dma_copy

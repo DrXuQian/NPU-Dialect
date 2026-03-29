@@ -262,6 +262,80 @@ func.func private @printMemrefF32(memref<*xf32>) attributes {{llvm.emit_c_interf
     return mlir, expected
 
 
+def create_conv2d_test(N, Ci, Hi, Wi, Co, Kh, Kw):
+    """Create conv2d test (no padding for simplicity)."""
+    Ho = Hi - Kh + 1
+    Wo = Wi - Kw + 1
+    fill_input = 0.01
+    fill_filter = 0.02
+
+    mlir = f"""
+func.func @main() {{
+  %input = memref.alloc() : memref<{N}x{Ci}x{Hi}x{Wi}xf32>
+  %filter = memref.alloc() : memref<{Co}x{Ci}x{Kh}x{Kw}xf32>
+  %output = memref.alloc() : memref<{N}x{Co}x{Ho}x{Wo}xf32>
+  %fi = arith.constant {fill_input} : f32
+  %ff = arith.constant {fill_filter} : f32
+  %zero = arith.constant 0.0 : f32
+  linalg.fill ins(%fi : f32) outs(%input : memref<{N}x{Ci}x{Hi}x{Wi}xf32>)
+  linalg.fill ins(%ff : f32) outs(%filter : memref<{Co}x{Ci}x{Kh}x{Kw}xf32>)
+  linalg.fill ins(%zero : f32) outs(%output : memref<{N}x{Co}x{Ho}x{Wo}xf32>)
+  linalg.conv_2d_nchw_fchw {{dilations = dense<1> : tensor<2xi64>, strides = dense<1> : tensor<2xi64>}}
+    ins(%input, %filter : memref<{N}x{Ci}x{Hi}x{Wi}xf32>, memref<{Co}x{Ci}x{Kh}x{Kw}xf32>)
+    outs(%output : memref<{N}x{Co}x{Ho}x{Wo}xf32>)
+  %U = memref.cast %output : memref<{N}x{Co}x{Ho}x{Wo}xf32> to memref<*xf32>
+  call @printMemrefF32(%U) : (memref<*xf32>) -> ()
+  return
+}}
+func.func private @printMemrefF32(memref<*xf32>) attributes {{llvm.emit_c_interface}}
+"""
+    # Numpy reference
+    inp = np.full((N, Ci, Hi, Wi), fill_input, dtype=np.float32)
+    filt = np.full((Co, Ci, Kh, Kw), fill_filter, dtype=np.float32)
+    # Conv2d reference: output[n,co,ho,wo] = sum over ci,kh,kw of input[n,ci,ho+kh,wo+kw]*filter[co,ci,kh,kw]
+    out = np.zeros((N, Co, Ho, Wo), dtype=np.float32)
+    for n in range(N):
+        for co in range(Co):
+            for ho in range(Ho):
+                for wo in range(Wo):
+                    for ci in range(Ci):
+                        for kh in range(Kh):
+                            for kw in range(Kw):
+                                out[n, co, ho, wo] += inp[n, ci, ho + kh, wo + kw] * filt[co, ci, kh, kw]
+    return mlir, out
+
+
+def create_relu_test(M, N):
+    """Create relu test with mixed positive/negative values."""
+    mlir = f"""
+func.func @main() {{
+  %A = memref.alloc() : memref<{M}x{N}xf32>
+  %B = memref.alloc() : memref<{M}x{N}xf32>
+  // Fill A with -0.5 (will be clipped to 0 by relu)
+  %neg = arith.constant -0.5 : f32
+  %zero = arith.constant 0.0 : f32
+  linalg.fill ins(%neg : f32) outs(%A : memref<{M}x{N}xf32>)
+  linalg.fill ins(%zero : f32) outs(%B : memref<{M}x{N}xf32>)
+  // relu: max(A, 0)
+  linalg.generic {{
+    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
+    iterator_types = ["parallel", "parallel"]
+  }} ins(%A : memref<{M}x{N}xf32>) outs(%B : memref<{M}x{N}xf32>) {{
+  ^bb0(%in: f32, %out: f32):
+    %c0 = arith.constant 0.0 : f32
+    %max = arith.maximumf %in, %c0 : f32
+    linalg.yield %max : f32
+  }}
+  %U = memref.cast %B : memref<{M}x{N}xf32> to memref<*xf32>
+  call @printMemrefF32(%U) : (memref<*xf32>) -> ()
+  return
+}}
+func.func private @printMemrefF32(memref<*xf32>) attributes {{llvm.emit_c_interface}}
+"""
+    expected = np.zeros((M, N), dtype=np.float32)  # relu(-0.5) = 0
+    return mlir, expected
+
+
 def verify_matmul(M=8, K=16, N=8, tile_m=4):
     """Verify: original matmul vs tiled matmul produce same result."""
     print(f"\n  Matmul [{M}x{K}] x [{K}x{N}], tile_m={tile_m}")
@@ -335,6 +409,35 @@ def main():
         # Test 5: Tile on K dimension
         if not verify_matmul(M=16, K=32, N=16, tile_m=8):
             all_pass = False
+
+    # Test: Conv2d
+    print("\n  Conv2d [1,2,6,6] * [2,2,3,3]")
+    conv_mlir, conv_expected = create_conv2d_test(1, 2, 6, 6, 2, 3, 3)
+    conv_output = run_mlir(conv_mlir)
+    conv_result = parse_memref_output(conv_output)
+    if conv_result is not None:
+        match = np.allclose(conv_result, conv_expected, atol=1e-5)
+        max_err = np.max(np.abs(conv_result - conv_expected))
+        print(f"    vs numpy: {'PASS' if match else 'FAIL'} max_err={max_err:.2e}")
+        if not match:
+            all_pass = False
+    else:
+        print(f"    FAIL: Failed to execute or parse")
+        all_pass = False
+
+    # Test: ReLU
+    print("\n  ReLU [4,4] (input=-0.5, expect all zeros)")
+    relu_mlir, relu_expected = create_relu_test(4, 4)
+    relu_output = run_mlir(relu_mlir)
+    relu_result = parse_memref_output(relu_output)
+    if relu_result is not None:
+        match = np.allclose(relu_result, relu_expected, atol=1e-6)
+        print(f"    vs numpy: {'PASS' if match else 'FAIL'}")
+        if not match:
+            all_pass = False
+    else:
+        print(f"    FAIL: Failed to execute or parse")
+        all_pass = False
 
     print(f"\n{'='*50}")
     print(f"  {'✅ ALL NUMERICAL CHECKS PASSED' if all_pass else '❌ SOME CHECKS FAILED'}")

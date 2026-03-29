@@ -211,6 +211,17 @@ public:
       mlir::Operation *op, const struct SplitDimSpec &dimSpec,
       int64_t numChunks) const;
 
+  /// Check tile alignment across a chain of ops (for fusion profitability).
+  /// Verifies that adjacent producer->consumer pairs have compatible tiling
+  /// shapes. If they differ (e.g., pooling halves a dim), computes the
+  /// overhead in bytes needed for reformatting.
+  struct TileAlignmentResult {
+    bool aligned = false;
+    int64_t alignmentOverheadBytes = 0;
+  };
+  TileAlignmentResult checkTileAlignment(
+      llvm::ArrayRef<mlir::Operation *> ops) const;
+
   /// Compare retile vs spill strategy.
   enum class SpillStrategy { Retile, Spill };
   SpillStrategy evaluateSpillStrategy(int64_t tileWorkingSet,
@@ -253,11 +264,11 @@ public:
   /// Estimate cycles for a npu.compute region.
   int64_t estimateComputeOp(mlir::Operation *op) const;
 
-private:
-  HWTarget target_;
-
   /// Generate tile-size candidates by halving a dimension.
   static llvm::SmallVector<int64_t> tileCandidates(int64_t dim);
+
+private:
+  HWTarget target_;
 };
 
 //===----------------------------------------------------------------------===//
