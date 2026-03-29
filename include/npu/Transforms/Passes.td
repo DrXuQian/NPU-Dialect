@@ -149,6 +149,47 @@ def NPUSRAMAllocation : Pass<"npu-sram-allocation", "mlir::func::FuncOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Pass 5b: DMA Scheduling (lower sync DMA to async ping/pong + prefetch)
+//===----------------------------------------------------------------------===//
+
+def NPUBarrierAlloc : Pass<"npu-barrier-alloc", "mlir::func::FuncOp"> {
+  let summary = "Allocate hardware barrier resources to DMA/compute subgraphs";
+  let description = [{
+    Assigns barrier_group IDs to ops based on cost model timeline analysis.
+
+    Design:
+    1. Build timeline: group ops into subgraphs (DMA_in → compute → DMA_out)
+    2. Allocate barrier IDs sequentially: subgraph 0 → barrier 0,
+       subgraph 1 → barrier 1, ...
+    3. When barrier pool exhausted → CUT (start new generation)
+    4. Double buffer: generation n+2 reuses generation n's barriers
+       (n+2 cannot start until n is fully complete)
+
+    No explicit wait/signal ops — barrier is an attribute on each op,
+    hardware manages the synchronization:
+
+      npu.dma_copy ... {barrier_group = 0 : i32}
+      linalg.matmul ... {barrier_group = 0 : i32}
+      npu.dma_copy ... {barrier_group = 0 : i32}
+      // subgraph 1
+      npu.dma_copy ... {barrier_group = 1 : i32}
+      ...
+      // CUT — pool exhausted, new generation
+      npu.dma_copy ... {barrier_group = 0 : i32, generation = 1 : i32}
+      // generation 1, barrier 0 → must wait for generation 0, barrier 0 to finish
+
+    The op ordering in IR IS the execution schedule.
+    Within a barrier_group, the hardware enforces DMA→compute→DMA ordering.
+    Between barrier_groups, ops on different engines can overlap.
+  }];
+  let options = [
+    Option<"barrierPoolSize", "barrier-pool-size", "int64_t", "4",
+           "Number of hardware barrier resources">,
+  ];
+  let dependentDialects = ["npu::NPUDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // Pass 2b: Core Mapping (make spatial core assignment explicit)
 //===----------------------------------------------------------------------===//
 

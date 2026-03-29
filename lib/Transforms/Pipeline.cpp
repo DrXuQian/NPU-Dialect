@@ -28,8 +28,10 @@ void npu::registerNPUPipeline() {
         pm.addPass(createCSEPass());
         // Pass 4: Bufferize (tensor → memref + npu.alloc_sram + npu.dma_copy)
         pm.addPass(npu::createNPUBufferize());
-        // Pass 5: SRAM allocation (dual-end, spill via DMA)
+        // Pass 5: SRAM allocation (dual-end, spill via DMA, double buffer, prefetch)
         pm.addNestedPass<func::FuncOp>(npu::createNPUSRAMAllocation());
+        // Pass 5b: Allocate hardware barrier resources
+        pm.addNestedPass<func::FuncOp>(npu::createNPUBarrierAlloc());
         // Pass 6: Cost evaluation (roofline, does not modify IR)
         pm.addNestedPass<func::FuncOp>(npu::createNPUCostEvaluate());
       });

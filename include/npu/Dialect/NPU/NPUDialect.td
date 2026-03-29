@@ -202,4 +202,24 @@ def NPU_BarrierOp : NPU_Op<"barrier"> {
   let assemblyFormat = "attr-dict";
 }
 
+def NPU_SyncOp : NPU_Op<"sync"> {
+  let summary = "Engine synchronization point — all engines complete before proceeding";
+  let description = [{
+    Separates execution phases. All hardware engines (DMA, matrix, DSP)
+    must complete their pending operations before any op after the sync
+    can begin.
+
+    Used to enforce ordering between DMA and compute phases:
+      [DMA_in phase]  → npu.sync → [Compute phase] → npu.sync → [DMA_out phase]
+
+    Within a phase, ops can execute in parallel on different engines.
+    The sync is the only ordering constraint.
+
+    Hardware maps this to whatever barrier mechanism it supports
+    (semaphore, fence, hardware event, etc.).
+  }];
+  let arguments = (ins OptionalAttr<StrAttr>:$phase);
+  let assemblyFormat = "($phase^)? attr-dict";
+}
+
 #endif // NPU_DIALECT_TD

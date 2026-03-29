@@ -31,6 +31,7 @@ PIPELINE_STEPS = [
     ("canonicalize", [MLIR_OPT, "--canonicalize", "--cse"]),
     ("bufferize",    [str(NPU_OPT), "--npu-bufferize"]),
     ("sram-alloc",   [str(NPU_OPT), "--npu-sram-allocation"]),
+    ("barrier-alloc", [str(NPU_OPT), "--npu-barrier-alloc"]),
     ("cost-eval",    [str(NPU_OPT), "--npu-cost-evaluate"]),
 ]
 

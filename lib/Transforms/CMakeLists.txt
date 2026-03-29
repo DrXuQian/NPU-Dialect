@@ -6,6 +6,7 @@ add_mlir_library(NPUTransforms
   TemporalTilingPass.cpp
   BufferizePass.cpp
   SRAMAllocationPass.cpp
+  DMASchedulingPass.cpp
   CostEvaluatePass.cpp
   SpillHandlingPass.cpp
   Pipeline.cpp
