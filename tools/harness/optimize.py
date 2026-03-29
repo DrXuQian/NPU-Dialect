@@ -132,16 +132,41 @@ def sweep_configurations(workload: str) -> list[RunResult]:
 def compare_strategies(workload: str) -> dict[str, RunResult]:
     """Compare different optimization strategies."""
     strategies = {
+        # Basic combinations
         "no_optimization": [],
         "fusion_only": ["--npu-fusion", "--npu-outline-fused-groups"],
-        "tiling_only": ["--npu-spatial-tiling", "--npu-temporal-tiling"],
-        "fusion+tiling": [
-            "--npu-fusion", "--npu-outline-fused-groups",
-            "--npu-spatial-tiling", "--npu-temporal-tiling",
+        "spatial_only_2c": ["--npu-spatial-tiling=num-cores=2"],
+        "spatial_only_4c": ["--npu-spatial-tiling=num-cores=4"],
+        "temporal_only_256k": ["--npu-temporal-tiling=sram-size=262144"],
+        "temporal_only_512k": ["--npu-temporal-tiling=sram-size=524288"],
+        "tiling_2c_256k": [
+            "--npu-spatial-tiling=num-cores=2",
+            "--npu-temporal-tiling=sram-size=262144",
         ],
-        "full_pipeline_no_eval": [
+        "tiling_4c_256k": [
+            "--npu-spatial-tiling=num-cores=4",
+            "--npu-temporal-tiling=sram-size=262144",
+        ],
+        # Full pipeline variants
+        "fuse+tile_2c_256k": [
             "--npu-fusion", "--npu-outline-fused-groups",
-            "--npu-spatial-tiling", "--npu-temporal-tiling",
+            "--npu-spatial-tiling=num-cores=2",
+            "--npu-temporal-tiling=sram-size=262144",
+        ],
+        "fuse+tile_4c_256k": [
+            "--npu-fusion", "--npu-outline-fused-groups",
+            "--npu-spatial-tiling=num-cores=4",
+            "--npu-temporal-tiling=sram-size=262144",
+        ],
+        "fuse+tile_4c_512k": [
+            "--npu-fusion", "--npu-outline-fused-groups",
+            "--npu-spatial-tiling=num-cores=4",
+            "--npu-temporal-tiling=sram-size=524288",
+        ],
+        "fuse+tile_8c_512k": [
+            "--npu-fusion", "--npu-outline-fused-groups",
+            "--npu-spatial-tiling=num-cores=8",
+            "--npu-temporal-tiling=sram-size=524288",
         ],
     }
 
@@ -151,9 +176,59 @@ def compare_strategies(workload: str) -> dict[str, RunResult]:
         results[name] = r
         cost = f"{r.overall_cost:.2e}s" if r.success else "FAIL"
         nkernels = len(r.kernels)
-        print(f"  {name:30s} → {cost} ({nkernels} kernels)")
+        print(f"  {name:30s} → {cost} ({nkernels} kernel(s))")
+
+    # Summary table
+    valid = {n: r for n, r in results.items() if r.success and r.overall_cost > 0}
+    if valid:
+        baseline_cost = results.get("no_optimization")
+        base_time = baseline_cost.overall_cost if baseline_cost and baseline_cost.success else None
+
+        print(f"\n  {'Strategy':30s} {'Time(s)':>12s} {'Speedup':>8s} {'Bound':>10s} {'AI':>8s}")
+        print(f"  {'-'*68}")
+        for name in sorted(valid, key=lambda n: valid[n].overall_cost):
+            r = valid[name]
+            t = r.overall_cost
+            speedup = f"{base_time/t:.2f}x" if base_time and t > 0 else "—"
+            # Use first kernel's metrics
+            k = r.kernels[0] if r.kernels else CostResult()
+            print(f"  {name:30s} {t:12.4e} {speedup:>8s} {k.bottleneck:>10s} {k.arithmetic_intensity:8.1f}")
 
     return results
+
+
+def batch_compare(workloads: list[str]) -> None:
+    """Run strategy comparison across multiple workloads."""
+    all_results = {}
+    for wl in workloads:
+        print(f"\n{'='*60}")
+        print(f"  Workload: {wl}")
+        print(f"{'='*60}")
+        all_results[wl] = compare_strategies(wl)
+
+    # Cross-workload summary
+    print(f"\n{'='*60}")
+    print(f"  Cross-Workload Summary")
+    print(f"{'='*60}")
+    strategies = set()
+    for wl_results in all_results.values():
+        strategies.update(wl_results.keys())
+
+    header = f"{'Strategy':30s}"
+    for wl in workloads:
+        header += f" {Path(wl).stem:>14s}"
+    print(f"  {header}")
+    print(f"  {'-'*(30 + 15*len(workloads))}")
+
+    for strat in sorted(strategies):
+        row = f"  {strat:30s}"
+        for wl in workloads:
+            r = all_results.get(wl, {}).get(strat)
+            if r and r.success and r.overall_cost > 0:
+                row += f" {r.overall_cost:14.2e}"
+            else:
+                row += f" {'FAIL':>14s}"
+        print(row)
 
 
 def print_report(results: list[RunResult], title: str = "Sweep Results"):
@@ -194,9 +269,10 @@ def print_report(results: list[RunResult], title: str = "Sweep Results"):
 
 def main():
     parser = argparse.ArgumentParser(description="NPU Compiler Optimization Harness")
-    parser.add_argument("--workload", required=True, help="Path to .mlir workload")
+    parser.add_argument("--workload", required=True, nargs="+", help="Path(s) to .mlir workload(s)")
     parser.add_argument("--sweep", action="store_true", help="Sweep over configurations")
     parser.add_argument("--compare-strategies", action="store_true", help="Compare optimization strategies")
+    parser.add_argument("--batch", action="store_true", help="Compare strategies across all workloads")
     parser.add_argument("--npu-opt", type=str, help="Path to npu-opt binary")
     args = parser.parse_args()
 
@@ -208,9 +284,16 @@ def main():
         print(f"Error: npu-opt not found at {NPU_OPT}", file=sys.stderr)
         sys.exit(1)
 
-    workload = args.workload
-    print(f"Workload: {workload}")
-    print(f"npu-opt:  {NPU_OPT}")
+    workloads = args.workload
+    print(f"Workload(s): {workloads}")
+    print(f"npu-opt:     {NPU_OPT}")
+
+    if args.batch:
+        batch_compare(workloads)
+        return
+
+    # Single workload mode
+    workload = workloads[0]
 
     # Always show baseline cost
     print("\n--- Baseline (no optimization) ---")
@@ -233,7 +316,6 @@ def main():
         print_report(results, f"Sweep: {Path(workload).stem}")
 
     if not args.sweep and not args.compare_strategies:
-        # Default: show cost for the standard pipeline
         print("\n--- Standard Pipeline ---")
         standard = run_pipeline(workload, [
             "--npu-fusion", "--npu-outline-fused-groups",
