@@ -210,25 +210,42 @@ struct NPUSRAMAllocationPass
     auto stepMap = buildStepMap(entryBlock);
     computeLiveness(buffers, stepMap);
 
-    // Phase 1: Try to fit everything with dual-end allocation
+    // Phase 1: Liveness-aware dual-end allocation with reuse.
+    // Process buffers in order of firstUse. When a buffer's lastUse
+    // is before the current buffer's firstUse, free it for reuse.
     DualEndAllocator allocator(sramSize);
 
-    // Sort: inputs first, then intermediates by firstUse, then outputs
+    // Sort ALL buffers by firstUse (liveness-ordered allocation).
     SmallVector<size_t> order(buffers.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-      if (buffers[a].role != buffers[b].role)
-        return static_cast<int>(buffers[a].role) <
-               static_cast<int>(buffers[b].role);
       return buffers[a].firstUse < buffers[b].firstUse;
     });
 
+    // Track active allocations for liveness-based freeing.
+    SmallVector<std::pair<size_t, int64_t>> active; // (bufIdx, lastUse)
     SmallVector<size_t> spillCandidates;
 
     for (size_t idx : order) {
       auto &buf = buffers[idx];
-      int64_t addr = -1;
 
+      // Free buffers whose liveness has ended before this buffer starts.
+      SmallVector<std::pair<size_t, int64_t>> stillActive;
+      for (auto &[aIdx, aLast] : active) {
+        if (aLast < buf.firstUse) {
+          // This buffer is dead — free its SRAM for reuse.
+          auto &aBuf = buffers[aIdx];
+          if (aBuf.role == BufRole::Input || aBuf.role == BufRole::Intermediate)
+            allocator.freeLow(aBuf.bytes);
+          // Note: high-end (output) frees not supported in simple allocator.
+        } else {
+          stillActive.push_back({aIdx, aLast});
+        }
+      }
+      active = std::move(stillActive);
+
+      // Allocate based on role.
+      int64_t addr = -1;
       switch (buf.role) {
       case BufRole::Input:
         addr = allocator.allocLow(buf.bytes);
@@ -243,6 +260,7 @@ struct NPUSRAMAllocationPass
 
       if (addr >= 0) {
         buf.sramAddr = addr;
+        active.push_back({idx, buf.lastUse});
       } else {
         spillCandidates.push_back(idx);
       }

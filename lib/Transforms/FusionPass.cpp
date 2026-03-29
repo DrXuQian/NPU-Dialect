@@ -12,6 +12,7 @@
 
 #include "npu/Transforms/Passes.h"
 #include "npu/Analysis/CostModel.h"
+#include "npu/Analysis/OperatorTilingSpec.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -59,6 +60,7 @@ static bool isMatrixOp(Operation *op) {
 
 /// Get single-use linalg consumers of an op (ops that use exactly one result
 /// of `op`, and that result has a single use).
+/// Skips connections that go through reshape ops (fusion boundaries).
 static SmallVector<Operation *>
 getSingleUseConsumers(Operation *op,
                       const llvm::DenseSet<Operation *> &linalgSet) {
@@ -67,6 +69,10 @@ getSingleUseConsumers(Operation *op,
     if (!result.hasOneUse())
       continue;
     Operation *user = *result.getUsers().begin();
+    // Don't fuse across reshape boundaries (tensor.collapse_shape /
+    // tensor.expand_shape).
+    if (npu::isReshapeBoundaryOp(user))
+      continue;
     // Walk up to find the actual linalg consumer (may be through
     // tensor.empty/fill chain).
     if (linalgSet.contains(user) && isComputeOp(user))
@@ -77,13 +83,20 @@ getSingleUseConsumers(Operation *op,
 
 /// Get single-use linalg producers of an op (ops whose result flows into
 /// `op` as an operand, and that result has a single use).
+/// Skips connections that go through reshape ops (fusion boundaries).
 static SmallVector<Operation *>
 getSingleUseProducers(Operation *op,
                       const llvm::DenseSet<Operation *> &linalgSet) {
   SmallVector<Operation *> producers;
   for (Value operand : op->getOperands()) {
     Operation *defOp = operand.getDefiningOp();
-    if (!defOp || !linalgSet.contains(defOp))
+    if (!defOp)
+      continue;
+    // Don't fuse across reshape boundaries (tensor.collapse_shape /
+    // tensor.expand_shape).
+    if (npu::isReshapeBoundaryOp(defOp))
+      continue;
+    if (!linalgSet.contains(defOp))
       continue;
     if (!isComputeOp(defOp))
       continue;

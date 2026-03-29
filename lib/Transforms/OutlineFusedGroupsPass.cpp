@@ -12,6 +12,7 @@
 #include "npu/Analysis/OperatorTilingSpec.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 
@@ -141,6 +142,23 @@ struct NPUOutlineFusedGroupsPass
         Operation *producer = operand.getDefiningOp();
         if (!producer || !linalgSet.contains(producer))
           continue;
+        // Don't fuse across reshape boundaries (tensor.collapse_shape /
+        // tensor.expand_shape). Check if the connecting value passes
+        // through a reshape op.
+        if (npu::isReshapeBoundaryOp(producer))
+          continue;
+        // Also check if any user between producer and consumer is a reshape.
+        {
+          bool reshapeBetween = false;
+          for (Operation *user : operand.getUsers()) {
+            if (user != consumer && npu::isReshapeBoundaryOp(user)) {
+              reshapeBetween = true;
+              break;
+            }
+          }
+          if (reshapeBetween)
+            continue;
+        }
         // Only merge if the producer has a single consumer (single use
         // for the connecting value).
         if (!producer->hasOneUse())

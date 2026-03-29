@@ -118,6 +118,9 @@ OperatorTilingSpec getMatmulTilingSpec();
 OperatorTilingSpec getConv2dNchwTilingSpec(int64_t Kh, int64_t Kw,
                                             int64_t strideH, int64_t strideW);
 
+/// batch_matmul C[B,M,N] = A[B,M,K] * B[B,K,N]
+OperatorTilingSpec getBatchMatmulTilingSpec();
+
 /// elementwise (generic with all parallel iterators)
 OperatorTilingSpec getElementwiseTilingSpec(unsigned rank);
 
@@ -125,6 +128,17 @@ OperatorTilingSpec getElementwiseTilingSpec(unsigned rank);
 OperatorTilingSpec getGenericTilingSpec(
     llvm::ArrayRef<mlir::utils::IteratorType> iterTypes,
     unsigned outputRank);
+
+/// linalg.transpose with given permutation and rank
+/// Tiling output dim i means tiling input dim perm[i].
+/// Spatial tiling picks the largest output dimension.
+/// Temporal tiling: avoid splitting — transpose should be at fusion boundaries.
+OperatorTilingSpec getTransposeTilingSpec(llvm::ArrayRef<int64_t> permutation,
+                                         unsigned rank);
+
+/// Check if an operation is a reshape (tensor.collapse_shape / tensor.expand_shape)
+/// that should act as a fusion/tiling boundary.
+bool isReshapeBoundaryOp(mlir::Operation *op);
 
 } // namespace npu
 

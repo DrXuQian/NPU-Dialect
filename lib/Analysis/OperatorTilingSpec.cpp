@@ -6,6 +6,7 @@
 
 #include "npu/Analysis/OperatorTilingSpec.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
 
 using namespace mlir;
@@ -75,6 +76,90 @@ OperatorTilingSpec npu::getMatmulTilingSpec() {
 
   spec.preferredSpatialDim = 0; // prefer split M for inter-core
   spec.preferredTemporalDims = {0, 1, 2}; // M, N, K
+
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
+// batch_matmul C[B,M,N] = A[B,M,K] * B[B,K,N]
+// Iteration domain: (d0=B, d1=M, d2=N, d3=K)
+// Indexing maps: A(d0,d1,d3), B(d0,d3,d2), C(d0,d1,d2)
+//===----------------------------------------------------------------------===//
+
+OperatorTilingSpec npu::getBatchMatmulTilingSpec() {
+  OperatorTilingSpec spec;
+  spec.opName = "linalg.batch_matmul";
+
+  // --- Split B (batch, dim 0): parallel, all operands split on dim 0 ---
+  {
+    SplitDimSpec s;
+    s.outputDim = 0;
+    s.iterDim = 0;
+    s.isParallel = true;
+    s.inputRules = {
+        {/*operandIdx=*/0, SliceKind::Split, /*sliceDim=*/0},  // A[tile_b, M, K]
+        {/*operandIdx=*/1, SliceKind::Split, /*sliceDim=*/0},  // B[tile_b, K, N]
+    };
+    s.outputRules = {
+        {/*operandIdx=*/0, SliceKind::Split, /*sliceDim=*/0},  // C[tile_b, M, N]
+    };
+    s.reuseRatio = 1.0; // both inputs split on batch
+    spec.splitDims.push_back(s);
+  }
+
+  // --- Split M (dim 1): parallel, A splits rows, B shared, C splits rows ---
+  {
+    SplitDimSpec s;
+    s.outputDim = 1;
+    s.iterDim = 1;
+    s.isParallel = true;
+    s.inputRules = {
+        {0, SliceKind::Split, 1},   // A[B, tile_m, K]
+        {1, SliceKind::Shared, 0},  // B[B, K, N] full (shared across M tiles)
+    };
+    s.outputRules = {
+        {0, SliceKind::Split, 1},   // C[B, tile_m, N]
+    };
+    s.reuseRatio = 2.0; // B is fully shared
+    spec.splitDims.push_back(s);
+  }
+
+  // --- Split N (dim 2): parallel, A shared, B splits cols, C splits cols ---
+  {
+    SplitDimSpec s;
+    s.outputDim = 2;
+    s.iterDim = 2;
+    s.isParallel = true;
+    s.inputRules = {
+        {0, SliceKind::Shared, 0},  // A[B, M, K] full (shared across N tiles)
+        {1, SliceKind::Split, 2},   // B[B, K, tile_n]
+    };
+    s.outputRules = {
+        {0, SliceKind::Split, 2},   // C[B, M, tile_n]
+    };
+    s.reuseRatio = 2.0; // A is fully shared
+    spec.splitDims.push_back(s);
+  }
+
+  // --- Split K (dim 3): reduction ---
+  {
+    SplitDimSpec s;
+    s.outputDim = UINT_MAX; // K is not an output dimension
+    s.iterDim = 3;
+    s.isParallel = false; // REDUCTION
+    s.inputRules = {
+        {0, SliceKind::Split, 2},   // A[B, M, tile_k]
+        {1, SliceKind::Split, 1},   // B[B, tile_k, N]
+    };
+    s.outputRules = {
+        {0, SliceKind::Reduce, 0},  // C[B, M, N] partial → needs accumulation
+    };
+    s.reuseRatio = 1.0;
+    spec.splitDims.push_back(s);
+  }
+
+  spec.preferredSpatialDim = 1; // prefer split M for inter-core
+  spec.preferredTemporalDims = {0, 1, 2, 3}; // B, M, N, K
 
   return spec;
 }
@@ -276,6 +361,58 @@ OperatorTilingSpec npu::getGenericTilingSpec(
 }
 
 //===----------------------------------------------------------------------===//
+// linalg.transpose
+// Tiling output dim i means tiling input dim perm[i].
+// All dimensions are parallel (permutation is a bijection).
+//===----------------------------------------------------------------------===//
+
+OperatorTilingSpec npu::getTransposeTilingSpec(
+    llvm::ArrayRef<int64_t> permutation, unsigned rank) {
+  OperatorTilingSpec spec;
+  spec.opName = "linalg.transpose";
+
+  for (unsigned dim = 0; dim < rank; ++dim) {
+    SplitDimSpec s;
+    s.outputDim = dim;
+    s.iterDim = dim;
+    s.isParallel = true;
+
+    // Tiling output dim `dim` means tiling input dim `perm[dim]`.
+    unsigned inputDim = static_cast<unsigned>(permutation[dim]);
+    s.inputRules = {
+        {/*operandIdx=*/0, SliceKind::Split, /*sliceDim=*/inputDim},
+    };
+    s.outputRules = {
+        {/*operandIdx=*/0, SliceKind::Split, /*sliceDim=*/dim},
+    };
+    // Transpose has no data reuse — each element is read and written exactly once.
+    s.reuseRatio = 1.0;
+    spec.splitDims.push_back(s);
+  }
+
+  // Spatial tiling: prefer the largest output dimension.
+  // We don't know the actual dimension sizes here, so we default to dim 0.
+  // The caller (SpatialTilingPass) will evaluate all parallel dims via cost model
+  // and pick the largest.
+  spec.preferredSpatialDim = 0;
+
+  // Temporal tiling: transpose should ideally be at fusion boundaries,
+  // so we avoid splitting. Set empty preferred temporal dims to signal
+  // "don't tile temporally".
+  spec.preferredTemporalDims = {};
+
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
+// Reshape boundary check
+//===----------------------------------------------------------------------===//
+
+bool npu::isReshapeBoundaryOp(Operation *op) {
+  return isa<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(op);
+}
+
+//===----------------------------------------------------------------------===//
 // Generic fallback: build from indexing_maps
 //===----------------------------------------------------------------------===//
 
@@ -381,9 +518,13 @@ OperatorTilingSpec npu::buildSpecFromIndexingMaps(Operation *op) {
 const OperatorTilingSpec *npu::getTilingSpec(Operation *op) {
   // Static specs for known ops (cached)
   static OperatorTilingSpec matmulSpec = getMatmulTilingSpec();
+  static OperatorTilingSpec batchMatmulSpec = getBatchMatmulTilingSpec();
 
   if (isa<linalg::MatmulOp>(op))
     return &matmulSpec;
+
+  if (isa<linalg::BatchMatmulOp>(op))
+    return &batchMatmulSpec;
 
   // Conv2d needs runtime kernel sizes, so build on the fly
   // (could cache by {Kh, Kw, strideH, strideW} key)
@@ -394,6 +535,23 @@ const OperatorTilingSpec *npu::getTilingSpec(Operation *op) {
     // TODO: extract strides from op attributes
     static OperatorTilingSpec convSpec = getConv2dNchwTilingSpec(Kh, Kw, 1, 1);
     return &convSpec;
+  }
+
+  // Transpose: build spec from permutation attribute
+  if (auto transposeOp = dyn_cast<linalg::TransposeOp>(op)) {
+    auto perm = transposeOp.getPermutation();
+    unsigned rank = perm.size();
+    // Cache by (rank, permutation hash)
+    thread_local llvm::DenseMap<uint64_t, OperatorTilingSpec> transposeSpecCache;
+    uint64_t key = rank;
+    for (unsigned i = 0; i < perm.size() && i < 8; ++i)
+      key = key * 31 + static_cast<uint64_t>(perm[i]);
+    auto it = transposeSpecCache.find(key);
+    if (it == transposeSpecCache.end()) {
+      auto spec = getTransposeTilingSpec(perm, rank);
+      it = transposeSpecCache.try_emplace(key, std::move(spec)).first;
+    }
+    return &it->second;
   }
 
   // Generic: build spec from iterator_types

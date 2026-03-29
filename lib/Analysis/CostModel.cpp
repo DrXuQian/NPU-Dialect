@@ -53,6 +53,16 @@ int64_t CostModel::opMACs(Operation *op) const {
     return M * N * K;
   }
 
+  if (auto batchMatmul = dyn_cast<linalg::BatchMatmulOp>(op)) {
+    auto outType = cast<ShapedType>(batchMatmul.getResult(0).getType());
+    auto lhsType = cast<ShapedType>(batchMatmul.getInputs()[0].getType());
+    int64_t B = safeDim(outType, 0);
+    int64_t M = safeDim(outType, 1);
+    int64_t N = safeDim(outType, 2);
+    int64_t K = safeDim(lhsType, 2);
+    return B * M * N * K;
+  }
+
   if (auto conv = dyn_cast<linalg::Conv2DNchwFchwOp>(op)) {
     auto outType = cast<ShapedType>(conv.getResult(0).getType());
     auto filterType = cast<ShapedType>(conv.getInputs()[1].getType());
@@ -81,8 +91,9 @@ int64_t CostModel::opMACs(Operation *op) const {
 int64_t CostModel::computeCycles(Operation *op) const {
   int64_t macs = opMACs(op);
 
-  // Determine unit: matmul/conv → matrix, everything else → dsp
+  // Determine unit: matmul/conv/batch_matmul → matrix, everything else → dsp
   bool isMatrix = isa<linalg::MatmulOp>(op) ||
+                  isa<linalg::BatchMatmulOp>(op) ||
                   isa<linalg::Conv2DNchwFchwOp>(op);
   int64_t throughput = isMatrix ? target_.matrixThroughput
                                 : target_.dspThroughput;
@@ -761,16 +772,42 @@ CostModel::SpatialSplitCost CostModel::evaluateSpatialSplitDetailed(
     }
   }
 
-  // DMA cycles
-  int64_t perCoreDmaCycles = dmaCycles(result.perCoreDmaInBytes);
+  // DMA cycles — use interconnect-aware cost for shared data.
+  // Shared operands: can use NoC broadcast (one core loads from DRAM,
+  // others receive via inter-core transfer) instead of each core
+  // independently loading from DRAM.
+  int64_t perCoreDmaCycles;
+  if (result.sharedDataBytes > 0 &&
+      target_.interconnect != InterconnectKind::DRAMOnly) {
+    // Split data: each core loads from DRAM
+    int64_t splitDmaCycles = dmaCycles(result.splitDataBytes +
+                                        result.haloOverheadBytes);
+    // Shared data: one core loads from DRAM, broadcast via NoC/shared mem
+    int64_t sharedLoadCycles = dmaCycles(result.sharedDataBytes); // one DRAM load
+    int64_t broadcastCycles =
+        target_.interCoreTransferCycles(result.sharedDataBytes); // NoC distribute
+    // Per-core sees: split DMA + broadcast receive (overlaps with DRAM load)
+    perCoreDmaCycles = splitDmaCycles +
+                       std::max(sharedLoadCycles / activeCores, broadcastCycles);
+  } else {
+    // DRAMOnly or no shared data: each core does full DRAM DMA
+    perCoreDmaCycles = dmaCycles(result.perCoreDmaInBytes);
+  }
 
   // Reduction penalty: need to accumulate partial results across cores
   int64_t reducePenalty = 0;
   if (result.needsReduce) {
     int64_t outBytes = tensorBytes(outType);
-    // Each core writes partial result, then reduce = (numCores-1) reads+adds
-    reducePenalty = (activeCores - 1) * dmaCycles(outBytes) +
-                    (activeCores - 1) * (outBytes / 2); // rough reduce compute
+    // Reduce via NoC (if available) or DRAM
+    if (target_.interconnect == InterconnectKind::DRAMOnly) {
+      reducePenalty = (activeCores - 1) * 2 * dmaCycles(outBytes);
+    } else {
+      // NoC reduce: tree reduction, log2(cores) steps
+      int64_t steps = 1;
+      int64_t c = activeCores;
+      while (c > 1) { steps++; c /= 2; }
+      reducePenalty = steps * target_.interCoreTransferCycles(outBytes);
+    }
   }
 
   // Idle core penalty

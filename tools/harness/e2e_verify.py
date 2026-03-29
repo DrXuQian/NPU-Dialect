@@ -9,8 +9,17 @@ Approach:
   5. Lower to LLVM + run via mlir-runner
   6. Compare with numpy reference (for known patterns) or sanity check
 
+Tiled verification (--verify-tiled):
+  1. Run original IR through e2e to get reference output
+  2. Run tiled IR (after spatial+temporal tiling) through structural checks:
+     a. Same function signature (input/output types)
+     b. Linalg ops are preserved (tiling doesn't lose ops)
+     c. Outlined functions have correct structure
+  3. If possible, run tiled IR through bufferize+lower+execute and compare
+
 Usage:
     python e2e_verify.py test/matmul_relu.mlir
+    python e2e_verify.py test/matmul_relu.mlir --verify-tiled
     python e2e_verify.py test/mlp.mlir test/conv2d_relu.mlir
 """
 
@@ -28,6 +37,10 @@ CONDA = os.environ.get("CONDA_PREFIX", "/home/qianxu/miniconda3")
 MLIR_OPT = "mlir-opt"
 MLIR_RUNNER = "mlir-runner"
 LIBS = f"{CONDA}/lib/libmlir_runner_utils.so,{CONDA}/lib/libmlir_c_runner_utils.so"
+
+# NPU tools
+SCRIPT_DIR = Path(__file__).resolve().parent
+NPU_OPT = SCRIPT_DIR.parent.parent / "build" / "tools" / "npu-opt" / "npu-opt"
 
 
 def run_cmd(cmd, timeout=60):
